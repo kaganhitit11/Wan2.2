@@ -13,6 +13,8 @@ import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
 from tqdm import tqdm
+from PIL import Image
+import torchvision.transforms as T
 
 from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
@@ -210,7 +212,9 @@ class WanT2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 init_image=None,
+                 strength=1.0):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -237,6 +241,13 @@ class WanT2V:
                 Random seed for noise generation. If -1, use random seed.
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
+            init_image (`str` | PIL.Image.Image | torch.Tensor, *optional*, defaults to None):
+                Optional reference image to control generation. If provided, the pipeline performs
+                image-to-video by starting denoising from a noised version of this image tiled across frames.
+                Accepts file path, PIL image, or a tensor of shape (3,H,W) in [-1,1] or [0,1].
+            strength (`float`, *optional*, defaults to 1.0):
+                Controls how much noise is added to the init image. 0 means no denoising (output ~ input),
+                1 means start from pure noise (ignore init image).
 
         Returns:
             torch.Tensor:
@@ -287,6 +298,60 @@ class WanT2V:
                 generator=seed_g)
         ]
 
+        # optional image-to-video init
+        encoded_from_image = None
+        use_img2vid = init_image is not None
+        if use_img2vid:
+            strength = float(max(0.0, min(1.0, strength)))
+
+            # prepare image tensor in [-1,1], shape (3, H, W)
+            img_tensor = None
+            if isinstance(init_image, str):
+                pil_img = Image.open(init_image).convert('RGB')
+                tfm = T.Compose([
+                    T.Resize((size[1], size[0]), interpolation=T.InterpolationMode.BILINEAR),
+                    T.ToTensor(),
+                    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                ])
+                img_tensor = tfm(pil_img)
+            elif isinstance(init_image, Image.Image):
+                pil_img = init_image.convert('RGB')
+                tfm = T.Compose([
+                    T.Resize((size[1], size[0]), interpolation=T.InterpolationMode.BILINEAR),
+                    T.ToTensor(),
+                    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                ])
+                img_tensor = tfm(pil_img)
+            elif torch.is_tensor(init_image):
+                img = init_image
+                if img.dim() == 3 and img.shape[0] in (1, 3):
+                    if img.dtype != torch.float32:
+                        img = img.float()
+                    # assume [0,1] or [-1,1]; clamp then map
+                    if img.min() >= 0.0 and img.max() <= 1.0:
+                        img = img * 2.0 - 1.0
+                    # resize to target
+                    img = img.unsqueeze(0)
+                    img = torch.nn.functional.interpolate(
+                        img, size=(size[1], size[0]), mode='bilinear', align_corners=False)
+                    img = img.squeeze(0)
+                    img_tensor = img
+                else:
+                    raise ValueError('`init_image` tensor must be shape (3,H,W) or (1,H,W)')
+            else:
+                raise ValueError('`init_image` must be a path, PIL image, or torch.Tensor')
+
+            img_tensor = img_tensor.to(self.device)
+            video = img_tensor.unsqueeze(1).repeat(1, F, 1, 1)  # (3, F, H, W)
+            encoded_from_image = self.vae.encode([video])[0]  # (C,T,H',W')
+
+            if strength == 0.0:
+                if offload_model:
+                    self.low_noise_model.cpu()
+                    self.high_noise_model.cpu()
+                    torch.cuda.empty_cache()
+                return self.vae.decode([encoded_from_image])[0]
+
         @contextmanager
         def noop_no_sync():
             yield
@@ -327,7 +392,30 @@ class WanT2V:
                 raise NotImplementedError("Unsupported solver.")
 
             # sample videos
-            latents = noise
+            # initialize latents either from image+strength or pure noise
+            if use_img2vid and strength < 1.0:
+                if sample_solver == 'unipc':
+                    num_inference_steps = len(timesteps)
+                else:  # dpm++ path returns timesteps via retrieve_timesteps
+                    num_inference_steps = len(timesteps)
+
+                init_timestep = int(sampling_steps * strength)
+                t_start = max(num_inference_steps - init_timestep, 0)
+
+                if t_start > 0:
+                    if hasattr(sample_scheduler, 'set_begin_index'):
+                        sample_scheduler.set_begin_index(t_start)
+                    timesteps = timesteps[t_start:]
+
+                noise_latent = torch.randn_like(encoded_from_image, generator=seed_g)
+                init_noised = sample_scheduler.add_noise(
+                    encoded_from_image.unsqueeze(0),
+                    noise_latent.unsqueeze(0),
+                    timesteps=torch.tensor([timesteps[0]], device=self.device, dtype=torch.int64),
+                )[0]
+                latents = [init_noised]
+            else:
+                latents = noise
 
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}

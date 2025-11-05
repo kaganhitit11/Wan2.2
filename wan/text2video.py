@@ -241,7 +241,7 @@ class WanT2V:
                 Random seed for noise generation. If -1, use random seed.
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
-            init_image (`str` | PIL.Image.Image | torch.Tensor, *optional*, defaults to None):
+            init_image (`str` | `os.PathLike` | PIL.Image.Image | torch.Tensor, *optional*, defaults to None):
                 Optional reference image to control generation. If provided, the pipeline performs
                 image-to-video by starting denoising from a noised version of this image tiled across frames.
                 Accepts file path, PIL image, or a tensor of shape (3,H,W) in [-1,1] or [0,1].
@@ -306,8 +306,8 @@ class WanT2V:
 
             # prepare image tensor in [-1,1], shape (3, H, W)
             img_tensor = None
-            if isinstance(init_image, str):
-                pil_img = Image.open(init_image).convert('RGB')
+            if isinstance(init_image, (str, os.PathLike)):
+                pil_img = Image.open(str(init_image)).convert('RGB')
                 tfm = T.Compose([
                     T.Resize((size[1], size[0]), interpolation=T.InterpolationMode.BILINEAR),
                     T.ToTensor(),

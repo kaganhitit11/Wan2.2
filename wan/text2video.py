@@ -407,7 +407,7 @@ class WanT2V:
                         sample_scheduler.set_begin_index(t_start)
                     timesteps = timesteps[t_start:]
 
-                noise_latent = torch.randn_like(encoded_from_image, generator=seed_g)
+                noise_latent = torch.randn_like(encoded_from_image, device=self.device)
                 init_noised = sample_scheduler.add_noise(
                     encoded_from_image.unsqueeze(0),
                     noise_latent.unsqueeze(0),
